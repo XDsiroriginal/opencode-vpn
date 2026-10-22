@@ -32,6 +32,7 @@ type VpnOptions = {
   healthCheckUrl?: string
   strict?: boolean
   rewriteProviders?: boolean
+  excludeProviders?: string[]
   exportEnv?: boolean
   noProxy?: string[]
   servers?: ServerConfig[]
@@ -390,14 +391,14 @@ function uptime(ms: number) {
 class Vpn {
   private options: VpnOptions
   private servers: ServerConfig[]
-  private host: string
-  private port: number
+  host: string
+  port: number
   private timeout: number
   private rotateMs: number
   private healthUrl: string
   private noProxy: string[]
   enabled: boolean
-  private external = false
+  private savedEnv: Record<string, string | undefined> | null = null
   private server: net.Server | null = null
   private command: ChildProcess | null = null
   private activeConfig: ServerConfig | null = null
@@ -439,10 +440,6 @@ class Vpn {
     }
     await this.bind()
     if (!this.enabled) return
-    if (this.external) {
-      this.applyProcessEnv()
-      return
-    }
     this.applyProcessEnv()
     void this.rotate()
   }
@@ -452,6 +449,7 @@ class Vpn {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
     await this.stopActive()
+    this.restoreProcessEnv()
     const server = this.server
     this.server = null
     if (server) await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -459,7 +457,7 @@ class Vpn {
 
   status() {
     const lines = [
-      `vpn: ${this.enabled ? "on" : "off"}${this.external ? " (external proxy)" : ""}`,
+      `vpn: ${this.enabled ? "on" : "off"}`,
       `proxy: http://${this.host}:${this.port}`,
       `server: ${this.activeName}${this.upstream ? ` (${this.upstream.kind})` : ""}`,
       `exit ip: ${this.exitIp || "unknown"}`,
@@ -495,7 +493,8 @@ class Vpn {
   async enable() {
     if (this.enabled) return "vpn already on"
     this.enabled = true
-    if (!this.server && !this.external) await this.bind()
+    if (!this.server) await this.bind()
+    if (!this.server) return this.status()
     this.applyProcessEnv()
     await this.rotate()
     return this.status()
@@ -506,6 +505,7 @@ class Vpn {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
     await this.stopActive()
+    this.restoreProcessEnv()
     this.upstream = null
     this.activeName = "direct"
     this.exitIp = ""
@@ -515,7 +515,6 @@ class Vpn {
 
   async rotate(): Promise<string> {
     if (!this.enabled) return "vpn disabled"
-    if (this.external) return "another opencode instance owns the proxy port"
     if (this.rotating) return "rotation already running"
     if (!this.servers.length) return "no servers configured"
     this.rotating = true
@@ -551,45 +550,84 @@ class Vpn {
   private schedule(delayMs = this.rotateMs) {
     if (this.timer) clearTimeout(this.timer)
     this.timer = null
-    if (!this.enabled || this.external || !this.servers.length) return
+    if (!this.enabled || !this.servers.length) return
     this.timer = setTimeout(() => {
       this.timer = null
       void this.rotate()
     }, delayMs)
   }
 
-  private async bind(): Promise<void> {
-    await new Promise<void>((resolve) => {
-      const server = net.createServer((socket) => {
-        this.log("debug", `vpn: client ${socket.remoteAddress}:${socket.remotePort}`)
-        void this.handle(socket)
-      })
-      server.once("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE") {
-          this.external = true
-          this.log("warn", `vpn: port ${this.port} busy, reusing the existing proxy`)
-        } else {
-          this.enabled = false
-          this.log("error", `vpn: proxy failed: ${err.message}`)
-        }
-        resolve()
-      })
-      server.listen(this.port, this.host, () => {
-        this.server = server
-        this.log("info", `vpn proxy listening on ${this.host}:${this.port}`)
-        resolve()
-      })
+  private listen(server: net.Server, port: number) {
+    return new Promise<NodeJS.ErrnoException | null>((resolve) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        server.off("listening", onListening)
+        resolve(err)
+      }
+      const onListening = () => {
+        server.off("error", onError)
+        const address = server.address()
+        if (address && typeof address === "object") this.port = address.port
+        resolve(null)
+      }
+      server.once("error", onError)
+      server.once("listening", onListening)
+      server.listen(port, this.host)
     })
+  }
+
+  private async bind(): Promise<void> {
+    const server = net.createServer((socket) => {
+      this.log("debug", `vpn: client ${socket.remoteAddress}:${socket.remotePort}`)
+      void this.handle(socket)
+    })
+
+    const configured = this.port
+    const first = await this.listen(server, configured)
+    if (!first) {
+      this.server = server
+      server.on("error", (err) => this.log("warn", `vpn: proxy error: ${err.message}`))
+      this.log("info", `vpn proxy listening on ${this.host}:${this.port}`)
+      return
+    }
+    if (first.code !== "EADDRINUSE") {
+      this.enabled = false
+      this.log("error", `vpn: proxy failed: ${first.message}`)
+      return
+    }
+
+    this.log("warn", `vpn: port ${configured} is busy (other app or instance), picking a free port`)
+    const retry = await this.listen(server, 0)
+    if (retry) {
+      this.enabled = false
+      this.log("error", `vpn: proxy failed: ${retry.message}`)
+      return
+    }
+    this.server = server
+    server.on("error", (err) => this.log("warn", `vpn: proxy error: ${err.message}`))
+    this.log("info", `vpn proxy listening on ${this.host}:${this.port}`)
   }
 
   private applyProcessEnv() {
     if (this.options.exportEnv === false) return
     const proxy = `http://${this.host}:${this.port}`
-    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
-      process.env[key] = proxy
+    const keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"]
+    if (!this.savedEnv) {
+      this.savedEnv = {}
+      for (const key of keys) this.savedEnv[key] = process.env[key]
     }
+    for (const key of keys.slice(0, 6)) process.env[key] = proxy
     process.env.NO_PROXY = this.noProxy.join(",")
     process.env.no_proxy = this.noProxy.join(",")
+  }
+
+  private restoreProcessEnv() {
+    const saved = this.savedEnv
+    this.savedEnv = null
+    if (!saved) return
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
   }
 
   private typeOf(config: ServerConfig): ServerType {
@@ -821,7 +859,7 @@ class Vpn {
     const port = Number(url.port || (secure ? 443 : 80))
     const socket = await directConnect(this.host, this.port, this.timeout)
     const reader = new Reader(socket)
-    let leftover = Buffer.alloc(0)
+    let leftover: Buffer = Buffer.alloc(0)
     let head = ""
     try {
       socket.write(`CONNECT ${url.hostname}:${port} HTTP/1.1\r\nHost: ${url.hostname}:${port}\r\n\r\n`)
@@ -856,11 +894,13 @@ class Vpn {
   }
 }
 
-function rewriteProviders(config: ConfigLike, port: number, log: Logger) {
+function rewriteProviders(config: ConfigLike, port: number, log: Logger, exclude: string[] = []) {
   const providers = config.provider
   if (!providers) return
+  const skip = new Set(exclude.map((id) => id.toLowerCase()))
   const prefix = `http://127.0.0.1:${port}${PREFIX}`
   for (const [id, provider] of Object.entries(providers)) {
+    if (skip.has(id.toLowerCase())) continue
     const options = provider?.options
     const base = options?.baseURL
     if (!options || typeof base !== "string" || base.startsWith(prefix)) continue
@@ -888,12 +928,12 @@ export const VpnPlugin: Plugin = async ({ client }) => {
   return {
     config: async (config) => {
       if (!vpn.enabled || options.rewriteProviders === false) return
-      rewriteProviders(config as unknown as ConfigLike, Number(options.listenPort || 7899), log)
+      rewriteProviders(config as unknown as ConfigLike, vpn.port, log, options.excludeProviders)
     },
 
     "shell.env": async (_input, output) => {
       if (!vpn.enabled || options.exportEnv === false) return
-      const proxy = `http://${options.listenHost || "127.0.0.1"}:${options.listenPort || 7899}`
+      const proxy = `http://${vpn.host}:${vpn.port}`
       for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
         output.env[key] = proxy
       }

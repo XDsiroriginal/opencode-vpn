@@ -7,6 +7,7 @@ Everything runs on the local machine: the plugin starts a local proxy, dials the
 ## Features
 
 - Local chained proxy on `127.0.0.1:7899` (HTTP CONNECT, plain HTTP, and a reverse path used by rewritten provider URLs).
+- If the port is busy (another app or another opencode instance), the plugin picks a free loopback port instead of hijacking a foreign listener. It never talks to a proxy it did not start.
 - `config` hook rewrites every non-local provider `baseURL` so model API traffic goes through the local proxy.
 - `shell.env` hook exports `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` to every tool subprocess.
 - The same variables are set on `process.env`, so runtimes that honor them (e.g. Bun) also route through the proxy.
@@ -40,11 +41,12 @@ Optional: launch opencode through `opencode-vpn.cmd` (Windows) so that proxy var
 | --- | --- | --- |
 | `enabled` | `true` | Master switch. `OPENCODE_VPN=0` disables at runtime. |
 | `listenHost` | `127.0.0.1` | Local proxy bind address. |
-| `listenPort` | `7899` | Local proxy port. Keep in sync with the launcher. |
+| `listenPort` | `7899` | Local proxy port. If busy, a free port is chosen at startup. |
 | `rotateMinutes` | `60` | Rotation interval. |
 | `connectTimeoutMs` | `15000` | Per-connection timeout. |
 | `healthCheckUrl` | `https://api.ipify.org` | Egress IP check through the proxy chain. |
 | `rewriteProviders` | `true` | Rewrite non-local provider `baseURL` values. |
+| `excludeProviders` | `[]` | Provider ids that must keep their original `baseURL`. |
 | `exportEnv` | `true` | Export proxy variables to tool subprocesses. |
 | `strict` | `false` | `true` blocks traffic when no endpoint is healthy instead of going direct. |
 | `noProxy` | loopback + RFC1918 | Hosts/patterns that bypass the proxy. |
@@ -77,7 +79,24 @@ Server entries:
 
 Set `"enabled": false` on an entry to keep it in the file but out of the pool. With an empty pool the plugin stays idle and opencode works normally.
 
-Local/private `baseURL`s are never rewritten: `localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `*.local`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`.
+Local/private `baseURL`s are never rewritten: `localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`, `*.local`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`. Use `excludeProviders` for anything else that must stay direct.
+
+## Isolation
+
+- The listener binds `listenHost` (default `127.0.0.1`) only; it is not reachable from the LAN.
+- Only opencode is affected: providers are rewritten inside opencode's own config object; proxy variables are exported to opencode's `process.env` and tool subprocesses, never written to the user or system environment.
+- Turning the VPN off (`vpn action=off`) or unloading the plugin restores the previous proxy variables.
+- A foreign process on the configured port is left untouched; the plugin moves to an ephemeral port.
+- Other VPN clients keep working: their local ports are just upstream endpoints, and loopback/LAN traffic never enters the chain.
+
+## Tests
+
+```powershell
+npm install
+npm test
+```
+
+The suite runs fully offline: it starts a local origin server, a mini SOCKS5 server, and a spawned command endpoint, then checks CONNECT/absolute-URI/reverse-path forwarding, provider rewriting (remote, localhost, excluded, no double rewrite), rotation fallback to direct, port-conflict fallback, loopback-only binding, env restore, BOM tolerance, and cleanup on dispose.
 
 ## Tool
 
@@ -92,7 +111,7 @@ vpn server=xray-us      -> activate a named endpoint
 ## How routing works
 
 1. Plugin starts `http://127.0.0.1:7899` (chained CONNECT/SOCKS5 client).
-2. `config` rewrites provider `baseURL` to `http://127.0.0.1:7899/p/<base64-origin><path>`; the proxy decodes the origin, opens TLS to it and forwards the request through the active endpoint.
+2. `config` rewrites provider `baseURL` to `http://127.0.0.1:<port>/p/<base64-origin><path>`; the proxy decodes the origin, opens TLS to it and forwards the request through the active endpoint.
 3. `shell.env` and `process.env` point proxy-aware tools at the same local port.
 4. Every `rotateMinutes` the next endpoint is started/dialed, checked with an HTTPS request to `healthCheckUrl`, and activated only if it returns an egress IP. Old `command` endpoints are stopped.
 
