@@ -1,0 +1,40 @@
+{
+  "enabled": true,
+  "listenHost": "127.0.0.1",
+  "listenPort": 7899,
+  "rotateMinutes": 60,
+  "connectTimeoutMs": 15000,
+  "healthCheckUrl": "https://api.ipify.org",
+  "rewriteProviders": true,
+  "exportEnv": true,
+  "strict": false,
+  "noProxy": ["localhost", "127.0.0.1", "::1", "10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"],
+  "servers": [
+    {
+      "name": "local-socks",
+      "type": "socks5",
+      "url": "socks5://127.0.0.1:10808",
+      "enabled": true
+    },
+    {
+      "name": "local-http",
+      "type": "http",
+      "url": "http://127.0.0.1:10809",
+      "enabled": false
+    },
+    {
+      "name": "xray-profile",
+      "type": "command",
+      "start": ["C:\\Program Files\\Xray\\xray.exe", "run", "-c", "C:\\vpn\\profile-us.json"],
+      "waitPort": 2082,
+      "url": "socks5://127.0.0.1:2082",
+      "waitMs": 10000,
+      "enabled": false
+    },
+    {
+      "name": "direct",
+      "type": "direct",
+      "enabled": false
+    }
+  ]
+}

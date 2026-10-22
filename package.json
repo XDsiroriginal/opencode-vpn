@@ -1,0 +1,19 @@
+{
+  "name": "opencode-vpn",
+  "version": "1.0.0",
+  "description": "opencode plugin that routes provider traffic through a local rotating VPN/proxy pool",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["opencode", "opencode-plugin", "vpn", "proxy", "socks5"],
+  "files": ["plugin", "vpn.example.json", "opencode-vpn.cmd"],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.2"
+  }
+}
